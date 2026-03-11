@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['NewCracks - v2 2024-05-18 10-54pm']
+
+roboflow:
+  workspace: vaibhav-tiwari
+  project: cracks-3ii36-ggtdw
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/vaibhav-tiwari/cracks-3ii36-ggtdw/dataset/1

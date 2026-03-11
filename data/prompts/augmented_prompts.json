@@ -1,0 +1,16 @@
+{
+    "cracks": [
+        "segment crack",
+        "segment wall crack",
+        "segment surface crack",
+        "segment drywall crack",
+        "segment structural crack"
+    ],
+    "drywall": [
+        "segment taping area",
+        "segment drywall seam",
+        "segment drywall joint",
+        "segment tape joint",
+        "segment drywall tape"
+    ]
+}
