@@ -1,8 +1,10 @@
 import os
 import argparse
 import time
+import random
 from distutils.util import strtobool
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -20,15 +22,24 @@ DATASET_DRYWALL_DIR = "Drywall-Join-Detect.v1i.yolov8"
 PROMPT_DIR = "prompts/augmented_prompts.json"
 
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def collate_fn(batch):
     images = [b["image"] for b in batch]
     masks = torch.stack([b["mask"] for b in batch])
     prompts = [b["prompt"] for b in batch]
+    image_ids = [b["image_id"] for b in batch]
 
     return {
         "image": images,
         "mask": masks,
-        "prompt": prompts
+        "prompt": prompts,
+        "image_id": image_ids,
     }
 
 
@@ -37,12 +48,13 @@ def parse_args():
 
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"))
     parser.add_argument("--arch", type=str, default="CLIPSeg")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True)
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
     parser.add_argument("--wandb-project-name", type=str, default="PromptSeg")
     parser.add_argument("--wandb-entity", type=str, default=None)
 
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -74,7 +86,7 @@ def prepare_batch(batch, processor, device):
         padding=True
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
-    masks = batch["mask"].to(device)
+    masks = batch["mask"].to(device).float()
     return inputs, masks
 
 
@@ -86,6 +98,8 @@ def forward_step(model, processor, batch, device, criterion):
 
     if logits.dim() == 3:
         logits = logits.unsqueeze(1)
+    elif logits.dim() != 4:
+        raise ValueError(f"Unexpected logits shape: {logits.shape}")
 
     target = F.interpolate(
         masks,
@@ -137,8 +151,9 @@ def evaluate(model, processor, loader, device, criterion):
 
 if __name__ == "__main__":
     args = parse_args()
+    set_seed(args.seed)
 
-    run_name = f"{args.exp_name}__{args.arch}__{int(time.time())}"
+    run_name = f"{args.exp_name}__{args.arch}__seed{args.seed}__{int(time.time())}"
     os.makedirs(args.save_dir, exist_ok=True)
 
     if args.track:
@@ -163,6 +178,7 @@ if __name__ == "__main__":
 
     prompts_path = os.path.join(ROOT, DATA_DIR, PROMPT_DIR)
 
+    # Train datasets: prompt augmentation allowed
     cracks_train_dataset = SegDataset(
         os.path.join(ROOT, DATA_DIR, DATASET_CRACKS_DIR, "train"),
         prompts_path=prompts_path
@@ -172,17 +188,19 @@ if __name__ == "__main__":
         prompts_path=prompts_path
     )
 
-    cracks_test_dataset = SegDataset(
-        os.path.join(ROOT, DATA_DIR, DATASET_CRACKS_DIR, "test"),
-        prompts_path=prompts_path
+    # Validation datasets: deterministic canonical prompts
+    cracks_valid_dataset = SegDataset(
+        os.path.join(ROOT, DATA_DIR, DATASET_CRACKS_DIR, "valid"),
+        prompts_path=prompts_path,
+        fixed_prompt="segment crack"
     )
-    drywall_test_dataset = SegDataset(
-        os.path.join(ROOT, DATA_DIR, DATASET_DRYWALL_DIR, "test"),
-        prompts_path=prompts_path
+    drywall_valid_dataset = SegDataset(
+        os.path.join(ROOT, DATA_DIR, DATASET_DRYWALL_DIR, "valid"),
+        prompts_path=prompts_path,
+        fixed_prompt="segment taping area"
     )
 
     train_dataset = ConcatDataset([cracks_train_dataset, drywall_train_dataset])
-    test_dataset = ConcatDataset([cracks_test_dataset, drywall_test_dataset])
 
     train_loader = DataLoader(
         train_dataset,
@@ -190,16 +208,25 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available() and args.cuda,
     )
 
-    test_loader = DataLoader(
-        test_dataset,
+    cracks_valid_loader = DataLoader(
+        cracks_valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available() and args.cuda,
+    )
+
+    drywall_valid_loader = DataLoader(
+        drywall_valid_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available() and args.cuda,
     )
 
     model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
@@ -209,7 +236,9 @@ if __name__ == "__main__":
     criterion = torch.nn.BCEWithLogitsLoss()
 
     global_step = 0
-    best_test_loss = float("inf")
+    best_macro_dice = -1.0
+
+    train_start_time = time.time()
 
     for epoch in range(args.num_epochs):
         model.train()
@@ -255,36 +284,66 @@ if __name__ == "__main__":
         writer.add_scalar("train/epoch_iou", train_iou, epoch)
         writer.add_scalar("train/epoch_dice", train_dice, epoch)
 
-        eval_stats = evaluate(model, processor, test_loader, device, criterion)
+        cracks_stats = evaluate(model, processor, cracks_valid_loader, device, criterion)
+        drywall_stats = evaluate(model, processor, drywall_valid_loader, device, criterion)
 
-        writer.add_scalar("test/loss", eval_stats["loss"], epoch)
-        writer.add_scalar("test/iou", eval_stats["iou"], epoch)
-        writer.add_scalar("test/dice", eval_stats["dice"], epoch)
+        macro_iou = 0.5 * (cracks_stats["iou"] + drywall_stats["iou"])
+        macro_dice = 0.5 * (cracks_stats["dice"] + drywall_stats["dice"])
+        macro_loss = 0.5 * (cracks_stats["loss"] + drywall_stats["loss"])
+
+        writer.add_scalar("val/cracks_loss", cracks_stats["loss"], epoch)
+        writer.add_scalar("val/cracks_iou", cracks_stats["iou"], epoch)
+        writer.add_scalar("val/cracks_dice", cracks_stats["dice"], epoch)
+
+        writer.add_scalar("val/drywall_loss", drywall_stats["loss"], epoch)
+        writer.add_scalar("val/drywall_iou", drywall_stats["iou"], epoch)
+        writer.add_scalar("val/drywall_dice", drywall_stats["dice"], epoch)
+
+        writer.add_scalar("val/macro_loss", macro_loss, epoch)
+        writer.add_scalar("val/macro_iou", macro_iou, epoch)
+        writer.add_scalar("val/macro_dice", macro_dice, epoch)
 
         print(
             f"[Epoch {epoch+1}] "
             f"Train Loss: {train_loss:.4f}, Train IoU: {train_iou:.4f}, Train Dice: {train_dice:.4f} | "
-            f"Test Loss: {eval_stats['loss']:.4f}, Test IoU: {eval_stats['iou']:.4f}, Test Dice: {eval_stats['dice']:.4f}"
+            f"Cracks Val Loss: {cracks_stats['loss']:.4f}, IoU: {cracks_stats['iou']:.4f}, Dice: {cracks_stats['dice']:.4f} | "
+            f"Drywall Val Loss: {drywall_stats['loss']:.4f}, IoU: {drywall_stats['iou']:.4f}, Dice: {drywall_stats['dice']:.4f} | "
+            f"Macro IoU: {macro_iou:.4f}, Macro Dice: {macro_dice:.4f}"
         )
 
-        sample_batch = eval_stats["sample_batch"]
-        sample_logits = eval_stats["sample_logits"]
-        sample_target = eval_stats["sample_target"]
+        # Log one example per task
+        for tag, stats in [("cracks", cracks_stats), ("drywall", drywall_stats)]:
+            sample_batch = stats["sample_batch"]
+            sample_logits = stats["sample_logits"]
+            sample_target = stats["sample_target"]
 
-        if sample_batch is not None:
-            sample_image = torch.tensor(sample_batch["image"][0]).permute(2, 0, 1).float() / 255.0
-            sample_pred = (torch.sigmoid(sample_logits[0]) > 0.5).float()
-            sample_gt = sample_target[0]
+            if sample_batch is not None:
+                sample_image = torch.from_numpy(sample_batch["image"][0]).permute(2, 0, 1).float() / 255.0
+                sample_pred = (torch.sigmoid(sample_logits[0]) > 0.5).float()
+                sample_gt = sample_target[0].float()
 
-            writer.add_image("samples/image", sample_image, epoch)
-            writer.add_image("samples/pred_mask", sample_pred, epoch)
-            writer.add_image("samples/gt_mask", sample_gt, epoch)
-            writer.add_text("samples/prompt", sample_batch["prompt"][0], epoch)
+                writer.add_image(f"samples/{tag}_image", sample_image, epoch)
+                writer.add_image(f"samples/{tag}_pred_mask", sample_pred, epoch)
+                writer.add_image(f"samples/{tag}_gt_mask", sample_gt, epoch)
+                writer.add_text(f"samples/{tag}_prompt", sample_batch["prompt"][0], epoch)
 
-        if eval_stats["loss"] < best_test_loss:
-            best_test_loss = eval_stats["loss"]
+        if macro_dice > best_macro_dice:
+            best_macro_dice = macro_dice
             save_path = os.path.join(args.save_dir, f"{run_name}_best.pt")
-            torch.save(model.state_dict(), save_path)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_macro_dice": best_macro_dice,
+                    "args": vars(args),
+                },
+                save_path,
+            )
             print(f"Saved best model to {save_path}")
 
+    total_train_time = time.time() - train_start_time
+    print(f"Total training time: {total_train_time:.2f} seconds")
+
+    writer.add_text("runtime/train_time_seconds", f"{total_train_time:.2f}")
     writer.close()
